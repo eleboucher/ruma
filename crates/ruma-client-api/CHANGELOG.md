@@ -9,6 +9,9 @@ Breaking changes:
 - The sticky events sliding sync extension follows the latest version of [MSC4480]: the `since`
   field of the request and the `next_batch` field of the response were removed, and the request
   gained the `lists` and `rooms` fields.
+- The `ToDevice`, `E2EE` and `ThreadSubscriptions` request types of `sync::sync_events::msc4186`
+  are now the ones of `sync::sync_events::v4`: their `enabled` field is a `bool`, and their
+  `is_empty()` method is renamed to `is_disabled()`.
 
 Bug fixes:
 
@@ -47,13 +50,10 @@ Improvements:
 - Add `sync::sync_events::v4` for the `/v4/sync` endpoint of [MSC4186], behind the
   `unstable-msc4186` cargo feature. Its extensions follow [MSC4508], [MSC4538], [MSC4543],
   [MSC4548] and [MSC4551].
-- Add conversions from the `sync::sync_events::msc4186` request to the `v4` request, and from
-  the `v4` response to the `msc4186` response.
-- Add unstable support for [MSC4360] "Threads extension to Sliding Sync", with the `threads` sliding
-  sync extension and the `get_thread_updates` endpoint.
+- Add conversions from the `sync::sync_events::v4` request and response to the `msc4186` request
+  and response.
 
 [MSC4186]: https://github.com/matrix-org/matrix-spec-proposals/pull/4186
-[MSC4360]: https://github.com/matrix-org/matrix-spec-proposals/pull/4360
 [MSC4480]: https://github.com/matrix-org/matrix-spec-proposals/pull/4480
 [MSC4508]: https://github.com/matrix-org/matrix-spec-proposals/pull/4508
 [MSC4532]: https://github.com/matrix-org/matrix-spec-proposals/pull/4532

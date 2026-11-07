@@ -15,7 +15,7 @@ Improvements:
 - Add unstable support for [MSC4363] "OAuth step up authentication".
 - Add unstable support for [MSC4532] "Revised Social Presence".
 - Add `FeatureFlag::Msc4186Stable`, the stable feature flag for [MSC4186].
-- Add the `FeatureFlag` variants for the sliding sync extensions of [MSC4262], [MSC4508],
+- Add the `FeatureFlag` variants for the `/sync` extensions of [MSC4262], [MSC4508],
   [MSC4538], [MSC4543], [MSC4548], [MSC4551] and [MSC4559].
 
 [MSC4186]: https://github.com/matrix-org/matrix-spec-proposals/pull/4186

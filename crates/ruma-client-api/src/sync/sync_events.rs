@@ -8,14 +8,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "unstable-msc4186")]
 pub mod msc4186;
-
 pub mod v3;
-
 #[cfg(feature = "unstable-msc4186")]
 pub mod v4;
-
-#[cfg(feature = "unstable-msc4186")]
-mod extensions;
 
 /// Unread notifications count.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

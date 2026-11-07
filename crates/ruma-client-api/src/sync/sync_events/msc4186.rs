@@ -12,7 +12,7 @@ use std::{collections::BTreeMap, time::Duration};
 use js_int::UInt;
 use js_option::JsOption;
 use ruma_common::{
-    OwnedMxcUri, OwnedRoomId, OwnedUserId, UserId,
+    OwnedMxcUri, OwnedRoomId, OwnedUserId,
     api::{auth_scheme::AccessToken, request, response},
     metadata,
     presence::PresenceState,
@@ -98,116 +98,45 @@ impl Request {
     pub fn new() -> Self {
         Default::default()
     }
+}
 
-    /// Converts this request to a [`v4::Request`].
-    ///
-    /// `user_id` is the ID of the user making the request, used to replace the `$ME` state keys.
-    ///
-    /// The conversion is lossy:
-    ///
-    /// * `txn_id` is dropped, so it must be copied to the [`Response`] separately.
-    /// * The `ranges` of each list are merged into a single range covering all of them.
-    /// * `*` in the `rooms` of an extension becomes all the room subscriptions.
-    pub fn into_v4(self, user_id: &UserId) -> v4::Request {
-        let Self {
-            pos,
+impl From<v4::Request> for Request {
+    fn from(value: v4::Request) -> Self {
+        let v4::Request {
             conn_id,
-            txn_id: _,
+            pos,
             timeout,
             set_presence,
             lists,
             room_subscriptions,
             extensions,
-        } = self;
+        } = value;
 
-        v4::Request {
-            conn_id,
+        Self {
             pos,
+            conn_id,
+            txn_id: None,
             timeout,
             set_presence,
-            lists: lists
-                .into_iter()
-                .map(|(key, list)| (key, list_into_v4(list, user_id)))
-                .collect(),
+            lists: lists.into_iter().map(|(key, list)| (key, list.into())).collect(),
             room_subscriptions: room_subscriptions
                 .into_iter()
-                .map(|(room_id, subscription)| {
-                    let subscription = v4::request::RoomSubscription {
-                        required_state: required_state_into_v4(
-                            subscription.required_state,
-                            user_id,
-                        ),
-                        timeline_limit: subscription.timeline_limit,
-                    };
-                    (room_id, subscription)
-                })
+                .map(|(room_id, subscription)| (room_id, subscription.into()))
                 .collect(),
             extensions: extensions.into(),
         }
     }
 }
 
-fn list_into_v4(list: request::List, user_id: &UserId) -> v4::request::List {
-    let request::List { ranges, room_details, filters } = list;
-
-    v4::request::List {
-        range: ranges.into_iter().reduce(|(start, end), (other_start, other_end)| {
-            (start.min(other_start), end.max(other_end))
-        }),
-        room_details: v4::request::RoomDetails {
-            required_state: required_state_into_v4(room_details.required_state, user_id),
-            timeline_limit: room_details.timeline_limit,
-        },
-        filters: filters.map(|filters| v4::request::ListFilters {
-            is_dm: filters.is_dm,
-            is_encrypted: filters.is_encrypted,
-            is_invited: filters.is_invite,
-            room_types: filters.room_types,
-            not_room_types: filters.not_room_types,
-            ..Default::default()
-        }),
-    }
-}
-
-fn required_state_into_v4(
-    required_state: Vec<(StateEventType, String)>,
-    user_id: &UserId,
-) -> v4::request::RequiredState {
-    let mut v4_required_state = v4::request::RequiredState::default();
-
-    for (event_type, state_key) in required_state {
-        if event_type == StateEventType::RoomMember && state_key == "$LAZY" {
-            v4_required_state.lazy_members = true;
-            continue;
-        }
-
-        let event_type = (event_type.to_string() != "*").then_some(event_type);
-        let state_key = match state_key.as_str() {
-            "*" => None,
-            "$ME" => Some(user_id.as_str().to_owned()),
-            _ => Some(state_key),
-        };
-
-        v4_required_state.include.push(v4::request::RequiredStateElement { event_type, state_key });
-    }
-
-    v4_required_state
-}
-
 /// HTTP types related to a [`Request`].
 pub mod request {
-    use std::collections::BTreeMap;
-
-    use as_variant::as_variant;
-    use ruma_common::{OwnedRoomId, RoomId, directory::RoomTypeFilter, serde::deserialize_cow_str};
+    use ruma_common::{RoomId, directory::RoomTypeFilter, serde::deserialize_cow_str};
     use serde::de::Error as _;
 
     #[cfg(feature = "unstable-msc4308")]
-    pub use super::super::extensions::request::ThreadSubscriptions;
-    #[cfg(feature = "unstable-msc4360")]
-    pub use super::super::extensions::request::Threads;
-    pub use super::super::extensions::request::{E2EE, ToDevice};
-    use super::{Deserialize, Serialize, StateEventType, UInt, v4};
+    pub use super::v4::request::ThreadSubscriptions;
+    pub use super::v4::request::{E2EE, ToDevice};
+    use super::{BTreeMap, Deserialize, OwnedRoomId, Serialize, StateEventType, UInt, v4};
 
     /// A sliding sync list request (see [`super::Request::lists`]).
     #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -223,6 +152,25 @@ pub mod request {
         /// Filters to apply to the list before sorting.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub filters: Option<ListFilters>,
+    }
+
+    /// The conversion is lossy: the `exclude` field of the required state and the `spaces`,
+    /// `tags` and `not_tags` filters are dropped.
+    ///
+    /// A missing `range` becomes a range covering all the rooms.
+    impl From<v4::request::List> for List {
+        fn from(value: v4::request::List) -> Self {
+            let v4::request::List { range, required_state, timeline_limit, filters } = value;
+
+            Self {
+                ranges: vec![range.unwrap_or((UInt::MIN, UInt::MAX))],
+                room_details: RoomDetails {
+                    required_state: required_state_from_v4(required_state),
+                    timeline_limit,
+                },
+                filters: (!filters.is_empty()).then(|| filters.into()),
+            }
+        }
     }
 
     /// A sliding sync list request filters (see [`List::filters`]).
@@ -261,6 +209,30 @@ pub mod request {
         pub not_room_types: Vec<RoomTypeFilter>,
     }
 
+    /// The conversion is lossy: the `spaces`, `tags` and `not_tags` filters are dropped.
+    impl From<v4::request::ListFilters> for ListFilters {
+        fn from(value: v4::request::ListFilters) -> Self {
+            let v4::request::ListFilters {
+                is_dm,
+                spaces: _,
+                is_encrypted,
+                is_invited,
+                room_types,
+                not_room_types,
+                tags: _,
+                not_tags: _,
+            } = value;
+
+            Self {
+                is_dm: is_dm.into(),
+                is_encrypted: is_encrypted.into(),
+                is_invite: is_invited.into(),
+                room_types,
+                not_room_types,
+            }
+        }
+    }
+
     /// Sliding sync request room subscription (see [`super::Request::room_subscriptions`]).
     #[derive(Clone, Debug, Default, Serialize, Deserialize)]
     #[cfg_attr(not(ruma_unstable_exhaustive_types), non_exhaustive)]
@@ -272,6 +244,37 @@ pub mod request {
 
         /// The maximum number of timeline events to return per room.
         pub timeline_limit: UInt,
+    }
+
+    /// The conversion is lossy: the `exclude` field of the required state is dropped.
+    impl From<v4::request::RoomSubscription> for RoomSubscription {
+        fn from(value: v4::request::RoomSubscription) -> Self {
+            let v4::request::RoomSubscription { required_state, timeline_limit } = value;
+            Self { required_state: required_state_from_v4(required_state), timeline_limit }
+        }
+    }
+
+    fn required_state_from_v4(
+        required_state: v4::request::RequiredState,
+    ) -> Vec<(StateEventType, String)> {
+        let v4::request::RequiredState { include, exclude: _, lazy_members } = required_state;
+
+        let mut required_state: Vec<_> = include
+            .into_iter()
+            .map(|element| {
+                let v4::request::RequiredStateElement { event_type, state_key } = element;
+                (
+                    event_type.unwrap_or_else(|| "*".into()),
+                    state_key.unwrap_or_else(|| "*".to_owned()),
+                )
+            })
+            .collect();
+
+        if lazy_members {
+            required_state.push((StateEventType::RoomMember, "$LAZY".to_owned()));
+        }
+
+        required_state
     }
 
     /// Sliding sync request room details (see [`List::room_details`]).
@@ -286,16 +289,16 @@ pub mod request {
         pub timeline_limit: UInt,
     }
 
-    /// Sliding sync request extensions.
+    /// Sliding sync request extensions (see [`super::Request::extensions`]).
     #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
     #[cfg_attr(not(ruma_unstable_exhaustive_types), non_exhaustive)]
     pub struct Extensions {
         /// Configure the to-device extension.
-        #[serde(default, skip_serializing_if = "ToDevice::is_empty")]
+        #[serde(default, skip_serializing_if = "ToDevice::is_disabled")]
         pub to_device: ToDevice,
 
         /// Configure the E2EE extension.
-        #[serde(default, skip_serializing_if = "E2EE::is_empty")]
+        #[serde(default, skip_serializing_if = "E2EE::is_disabled")]
         pub e2ee: E2EE,
 
         /// Configure the account data extension.
@@ -314,19 +317,10 @@ pub mod request {
         #[cfg(feature = "unstable-msc4308")]
         #[serde(
             default,
-            skip_serializing_if = "ThreadSubscriptions::is_empty",
+            skip_serializing_if = "ThreadSubscriptions::is_disabled",
             rename = "io.element.msc4308.thread_subscriptions"
         )]
         pub thread_subscriptions: ThreadSubscriptions,
-
-        /// Configure the threads extension.
-        #[cfg(feature = "unstable-msc4360")]
-        #[serde(
-            default,
-            skip_serializing_if = "Threads::is_empty",
-            rename = "io.element.msc4360.threads"
-        )]
-        pub threads: Threads,
 
         /// Configure the profiles extension.
         #[cfg(feature = "unstable-msc4262")]
@@ -363,47 +357,7 @@ pub mod request {
     impl Extensions {
         /// Whether all fields are empty or `None`.
         pub fn is_empty(&self) -> bool {
-            #[allow(unused_mut)]
-            let mut empty = self.to_device.is_empty()
-                && self.e2ee.is_empty()
-                && self.account_data.is_empty()
-                && self.receipts.is_empty()
-                && self.typing.is_empty()
-                && self.other.is_empty();
-
-            #[cfg(feature = "unstable-msc4308")]
-            {
-                empty = empty && self.thread_subscriptions.is_empty();
-            }
-
-            #[cfg(feature = "unstable-msc4360")]
-            {
-                empty = empty && self.threads.is_empty();
-            }
-
-            #[cfg(feature = "unstable-msc4262")]
-            {
-                empty = empty && self.profiles.is_empty();
-            }
-
-            #[cfg(feature = "unstable-msc4480")]
-            {
-                empty = empty && self.sticky_events.is_empty();
-            }
-
-            #[cfg(feature = "unstable-msc4559")]
-            {
-                empty = empty && self.presence.is_empty();
-            }
-
-            empty
-        }
-    }
-
-    /// `*` in the `rooms` of an extension becomes all the room subscriptions.
-    impl From<Extensions> for v4::request::Extensions {
-        fn from(value: Extensions) -> Self {
-            let Extensions {
+            let Self {
                 to_device,
                 e2ee,
                 account_data,
@@ -411,8 +365,57 @@ pub mod request {
                 typing,
                 #[cfg(feature = "unstable-msc4308")]
                 thread_subscriptions,
-                #[cfg(feature = "unstable-msc4360")]
-                threads,
+                #[cfg(feature = "unstable-msc4262")]
+                profiles,
+                #[cfg(feature = "unstable-msc4480")]
+                sticky_events,
+                #[cfg(feature = "unstable-msc4559")]
+                presence,
+                other,
+            } = self;
+
+            #[allow(unused_mut)]
+            let mut empty = to_device.is_disabled()
+                && e2ee.is_disabled()
+                && account_data.is_empty()
+                && receipts.is_empty()
+                && typing.is_empty()
+                && other.is_empty();
+
+            #[cfg(feature = "unstable-msc4308")]
+            {
+                empty &= thread_subscriptions.is_disabled();
+            }
+
+            #[cfg(feature = "unstable-msc4262")]
+            {
+                empty &= profiles.is_empty();
+            }
+
+            #[cfg(feature = "unstable-msc4480")]
+            {
+                empty &= sticky_events.is_empty();
+            }
+
+            #[cfg(feature = "unstable-msc4559")]
+            {
+                empty &= presence.is_empty();
+            }
+
+            empty
+        }
+    }
+
+    impl From<v4::request::Extensions> for Extensions {
+        fn from(value: v4::request::Extensions) -> Self {
+            let v4::request::Extensions {
+                to_device,
+                e2ee,
+                account_data,
+                receipts,
+                typing,
+                #[cfg(feature = "unstable-msc4308")]
+                thread_subscriptions,
                 #[cfg(feature = "unstable-msc4262")]
                 profiles,
                 #[cfg(feature = "unstable-msc4480")]
@@ -425,52 +428,54 @@ pub mod request {
             Self {
                 to_device,
                 e2ee,
-                account_data: v4::request::AccountData {
-                    enabled: account_data.enabled,
+                account_data: AccountData {
+                    enabled: enabled_from_v4(account_data.enabled),
                     lists: account_data.lists,
-                    rooms: rooms_into_v4(account_data.rooms),
+                    rooms: rooms_from_v4(account_data.rooms),
                 },
-                receipts: v4::request::Receipts {
-                    enabled: receipts.enabled,
+                receipts: Receipts {
+                    enabled: enabled_from_v4(receipts.enabled),
                     lists: receipts.lists,
-                    rooms: rooms_into_v4(receipts.rooms),
+                    rooms: rooms_from_v4(receipts.rooms),
                 },
-                typing: v4::request::Typing {
-                    enabled: typing.enabled,
+                typing: Typing {
+                    enabled: enabled_from_v4(typing.enabled),
                     lists: typing.lists,
-                    rooms: rooms_into_v4(typing.rooms),
+                    rooms: rooms_from_v4(typing.rooms),
                 },
                 #[cfg(feature = "unstable-msc4308")]
                 thread_subscriptions,
-                #[cfg(feature = "unstable-msc4360")]
-                threads,
                 #[cfg(feature = "unstable-msc4262")]
-                profiles: v4::request::Profiles {
-                    enabled: profiles.enabled,
-                    fields: profiles.fields,
+                profiles: Profiles {
+                    enabled: enabled_from_v4(profiles.enabled),
                     lists: profiles.lists,
-                    rooms: rooms_into_v4(profiles.rooms),
+                    rooms: rooms_from_v4(profiles.rooms),
+                    fields: profiles.fields,
                 },
                 #[cfg(feature = "unstable-msc4480")]
-                sticky_events: v4::request::StickyEvents {
-                    enabled: sticky_events.enabled,
+                sticky_events: StickyEvents {
+                    enabled: enabled_from_v4(sticky_events.enabled),
                     limit: sticky_events.limit,
                     lists: sticky_events.lists,
-                    rooms: rooms_into_v4(sticky_events.rooms),
+                    rooms: rooms_from_v4(sticky_events.rooms),
                 },
                 #[cfg(feature = "unstable-msc4559")]
-                presence: v4::request::Presence {
-                    enabled: presence.enabled,
+                presence: Presence {
+                    enabled: enabled_from_v4(presence.enabled),
                     lists: presence.lists,
-                    rooms: rooms_into_v4(presence.rooms),
+                    rooms: rooms_from_v4(presence.rooms),
                 },
                 other,
             }
         }
     }
 
-    fn rooms_into_v4(rooms: Option<Vec<ExtensionRoomConfig>>) -> Option<Vec<OwnedRoomId>> {
-        rooms?.into_iter().map(|room| as_variant!(room, ExtensionRoomConfig::Room)).collect()
+    fn enabled_from_v4(enabled: bool) -> Option<bool> {
+        enabled.then_some(true)
+    }
+
+    fn rooms_from_v4(rooms: Option<Vec<OwnedRoomId>>) -> Option<Vec<ExtensionRoomConfig>> {
+        rooms.map(|rooms| rooms.into_iter().map(ExtensionRoomConfig::Room).collect())
     }
 
     /// Single entry for a room subscription configuration in an extension request.
@@ -545,7 +550,7 @@ pub mod request {
     impl StickyEvents {
         /// Whether all fields are empty or `None`.
         pub fn is_empty(&self) -> bool {
-            self.enabled.is_none() && self.limit.is_none()
+            self.enabled.is_none()
         }
     }
 
@@ -767,7 +772,6 @@ impl Response {
     }
 }
 
-/// The conversion is lossy in the same way as for [`response::Room`], and `txn_id` is not set.
 impl From<v4::Response> for Response {
     fn from(value: v4::Response) -> Self {
         let v4::Response { pos, lists, rooms, extensions } = value;
@@ -794,17 +798,15 @@ pub mod response {
     };
     use serde_json::{json, value::to_raw_value as to_raw_json_value};
 
-    pub use super::super::extensions::response::AccountData;
+    pub use super::v4::response::AccountData;
     #[cfg(feature = "unstable-msc4262")]
-    pub use super::super::extensions::response::Profiles;
+    pub use super::v4::response::Profiles;
     #[cfg(feature = "unstable-msc4308")]
-    pub use super::super::extensions::response::ThreadSubscriptions;
-    #[cfg(feature = "unstable-msc4360")]
-    pub use super::super::extensions::response::Threads;
+    pub use super::v4::response::ThreadSubscriptions;
     #[cfg(feature = "unstable-msc4559")]
-    pub use super::super::extensions::response::{Presence, PresenceUpdate};
+    pub use super::v4::response::{Presence, PresenceUpdate};
     #[cfg(feature = "unstable-msc4480")]
-    pub use super::super::extensions::response::{StickyEvents, StickyEventsRoom};
+    pub use super::v4::response::{StickyEvents, StickyEventsRoom};
     use super::{
         super::DeviceLists, AnySyncStateEvent, AnySyncTimelineEvent, BTreeMap, Deserialize,
         JsOption, OwnedMxcUri, OwnedRoomId, OwnedUserId, Raw, Serialize, UInt,
@@ -920,45 +922,54 @@ pub mod response {
     /// entries and the removal of the room name are dropped.
     impl From<v4::response::Room> for Room {
         fn from(value: v4::response::Room) -> Self {
-            let v4::response::Room {
-                bump_stamp,
-                membership: _,
-                lists: _,
-                name,
-                avatar,
-                heroes,
-                is_dm,
-                initial,
-                expanded_timeline: _,
-                required_state,
-                timeline,
-                prev_batch,
-                limited,
-                num_live,
-                joined_count,
-                invited_count,
-                stripped_state,
-            } = value;
+            let v4::response::Room { bump_stamp, membership: _, lists: _, data } = value;
 
-            Self {
-                name: name.into_option(),
-                avatar,
-                initial: initial.then_some(true),
-                is_dm,
-                invite_state: stripped_state,
-                unread_notifications: UnreadNotificationsCount::new(),
-                timeline,
-                required_state: required_state
-                    .into_iter()
-                    .filter_map(|entry| as_variant!(entry, v4::response::RequiredStateEntry::Event))
-                    .collect(),
-                prev_batch,
-                limited,
-                joined_count,
-                invited_count,
-                num_live,
-                bump_stamp,
-                heroes: heroes.map(|heroes| heroes.into_iter().map(Into::into).collect()),
+            match data {
+                v4::response::RoomData::Full(data) => {
+                    let v4::response::FullRoomData {
+                        name,
+                        avatar,
+                        heroes,
+                        is_dm,
+                        initial,
+                        expanded_timeline: _,
+                        required_state,
+                        timeline,
+                        prev_batch,
+                        limited,
+                        num_live,
+                        joined_count,
+                        invited_count,
+                    } = data;
+
+                    Self {
+                        name: name.into_option(),
+                        avatar,
+                        initial: initial.then_some(true),
+                        is_dm,
+                        invite_state: None,
+                        unread_notifications: UnreadNotificationsCount::new(),
+                        timeline,
+                        required_state: required_state
+                            .into_iter()
+                            .filter_map(|entry| {
+                                as_variant!(entry, v4::response::RequiredStateEntry::Event)
+                            })
+                            .collect(),
+                        prev_batch,
+                        limited,
+                        joined_count,
+                        invited_count,
+                        num_live,
+                        bump_stamp,
+                        heroes: heroes.map(|heroes| heroes.into_iter().map(Into::into).collect()),
+                    }
+                }
+                v4::response::RoomData::Stripped(data) => {
+                    let v4::response::StrippedRoomData { stripped_state } = data;
+
+                    Self { invite_state: Some(stripped_state), bump_stamp, ..Default::default() }
+                }
             }
         }
     }
@@ -1002,8 +1013,8 @@ pub mod response {
 
     impl From<v4::response::Hero> for Hero {
         fn from(value: v4::response::Hero) -> Self {
-            let v4::response::Hero { user_id, name, avatar } = value;
-            Self { user_id, name, avatar }
+            let v4::response::Hero { user_id, displayname, avatar_url } = value;
+            Self { user_id, name: displayname, avatar: avatar_url }
         }
     }
 
@@ -1040,15 +1051,6 @@ pub mod response {
         )]
         pub thread_subscriptions: ThreadSubscriptions,
 
-        /// Threads extension response.
-        #[cfg(feature = "unstable-msc4360")]
-        #[serde(
-            default,
-            skip_serializing_if = "Threads::is_empty",
-            rename = "io.element.msc4360.threads"
-        )]
-        pub threads: Threads,
-
         /// Profiles extension response.
         #[cfg(feature = "unstable-msc4262")]
         #[serde(
@@ -1082,43 +1084,53 @@ pub mod response {
         ///
         /// True if neither to-device, e2ee nor account data are to be found.
         pub fn is_empty(&self) -> bool {
+            let Self {
+                to_device,
+                e2ee,
+                account_data,
+                receipts,
+                typing,
+                #[cfg(feature = "unstable-msc4308")]
+                thread_subscriptions,
+                #[cfg(feature = "unstable-msc4262")]
+                profiles,
+                #[cfg(feature = "unstable-msc4480")]
+                sticky_events,
+                #[cfg(feature = "unstable-msc4559")]
+                presence,
+            } = self;
+
             #[allow(unused_mut)]
-            let mut empty = self.to_device.is_none()
-                && self.e2ee.is_empty()
-                && self.account_data.is_empty()
-                && self.receipts.is_empty()
-                && self.typing.is_empty();
+            let mut empty = to_device.is_none()
+                && e2ee.is_empty()
+                && account_data.is_empty()
+                && receipts.is_empty()
+                && typing.is_empty();
 
             #[cfg(feature = "unstable-msc4308")]
             {
-                empty = empty && self.thread_subscriptions.is_empty();
-            }
-
-            #[cfg(feature = "unstable-msc4360")]
-            {
-                empty = empty && self.threads.is_empty();
+                empty &= thread_subscriptions.is_empty();
             }
 
             #[cfg(feature = "unstable-msc4262")]
             {
-                empty = empty && self.profiles.is_empty();
+                empty &= profiles.is_empty();
             }
 
             #[cfg(feature = "unstable-msc4480")]
             {
-                empty = empty && self.sticky_events.is_empty();
+                empty &= sticky_events.is_empty();
             }
 
             #[cfg(feature = "unstable-msc4559")]
             {
-                empty = empty && self.presence.is_empty();
+                empty &= presence.is_empty();
             }
 
             empty
         }
     }
 
-    /// The typing and receipts events are rebuilt from their content.
     impl From<v4::response::Extensions> for Extensions {
         fn from(value: v4::response::Extensions) -> Self {
             let v4::response::Extensions {
@@ -1129,8 +1141,6 @@ pub mod response {
                 typing,
                 #[cfg(feature = "unstable-msc4308")]
                 thread_subscriptions,
-                #[cfg(feature = "unstable-msc4360")]
-                threads,
                 #[cfg(feature = "unstable-msc4262")]
                 profiles,
                 #[cfg(feature = "unstable-msc4480")]
@@ -1140,17 +1150,25 @@ pub mod response {
             } = value;
 
             Self {
-                to_device: to_device.map(|to_device| ToDevice {
-                    next_batch: to_device.next_batch,
-                    events: to_device.messages,
+                to_device: to_device.map(|to_device| {
+                    let v4::response::ToDevice { next_batch, messages } = to_device;
+                    ToDevice { next_batch, events: messages }
                 }),
                 e2ee: e2ee
-                    .map(|e2ee| E2EE {
-                        device_lists: e2ee.device_lists,
-                        device_one_time_keys_count: e2ee.device_one_time_keys_count,
-                        device_unused_fallback_key_types: Some(
-                            e2ee.device_unused_fallback_key_types,
-                        ),
+                    .map(|e2ee| {
+                        let v4::response::E2EE {
+                            device_lists,
+                            device_one_time_keys_count,
+                            device_unused_fallback_key_types,
+                        } = e2ee;
+
+                        E2EE {
+                            device_lists,
+                            device_one_time_keys_count,
+                            device_unused_fallback_key_types: Some(
+                                device_unused_fallback_key_types,
+                            ),
+                        }
                     })
                     .unwrap_or_default(),
                 account_data,
@@ -1181,8 +1199,6 @@ pub mod response {
                 },
                 #[cfg(feature = "unstable-msc4308")]
                 thread_subscriptions,
-                #[cfg(feature = "unstable-msc4360")]
-                threads,
                 #[cfg(feature = "unstable-msc4262")]
                 profiles,
                 #[cfg(feature = "unstable-msc4480")]
@@ -1280,7 +1296,7 @@ pub mod response {
 #[cfg(test)]
 mod tests {
     use js_int::uint;
-    use ruma_common::{assert_to_canonical_json_eq, owned_room_id, user_id};
+    use ruma_common::{assert_to_canonical_json_eq, owned_room_id};
     use ruma_events::StateEventType;
     use serde_json::{from_value as from_json_value, json};
 
@@ -1309,65 +1325,45 @@ mod tests {
     }
 
     #[test]
-    fn request_into_v4() {
-        let mut request = Request::new();
-        request.txn_id = Some("txn".to_owned());
-        request.lists.insert(
-            "all".to_owned(),
-            request::List {
-                ranges: vec![(uint!(10), uint!(19)), (uint!(0), uint!(9))],
-                room_details: request::RoomDetails {
-                    required_state: vec![
-                        ("*".into(), "*".to_owned()),
-                        (StateEventType::RoomMember, "$LAZY".to_owned()),
-                        (StateEventType::RoomMember, "$ME".to_owned()),
-                        (StateEventType::RoomTopic, String::new()),
-                    ],
-                    timeline_limit: uint!(10),
-                },
-                filters: Some(request::ListFilters {
-                    is_invite: Some(false),
-                    ..Default::default()
-                }),
-            },
-        );
+    fn request_from_v4() {
+        let mut required_state = v4::request::RequiredState::new();
+        required_state.include = vec![
+            v4::request::RequiredStateElement::new(),
+            v4::request::RequiredStateElement::new()
+                .with_event_type(StateEventType::RoomTopic)
+                .with_state_key(String::new()),
+        ];
+        required_state.lazy_members = true;
 
-        let mut request = request.into_v4(user_id!("@alice:example.com"));
+        let mut list = v4::request::List::new(required_state, uint!(10));
+        list.filters.is_invited = v4::request::FilterMode::Exclude;
+
+        let mut v4_request = v4::Request::new();
+        v4_request.lists.insert("all".to_owned(), list);
+
+        let mut request = Request::from(v4_request);
 
         assert_to_canonical_json_eq!(
             request.lists.remove("all").unwrap(),
             json!({
-                "range": [0, 19],
-                "required_state": {
-                    "include": [
-                        {},
-                        { "type": "m.room.member", "state_key": "@alice:example.com" },
-                        { "type": "m.room.topic", "state_key": "" },
-                    ],
-                    "lazy_members": true,
-                },
+                "ranges": [[0, 9_007_199_254_740_991_u64]],
+                "required_state": [["*", "*"], ["m.room.topic", ""], ["m.room.member", "$LAZY"]],
                 "timeline_limit": 10,
-                "filters": { "is_invited": false },
+                "filters": { "is_invite": false },
             })
         );
     }
 
     #[test]
-    fn extensions_into_v4() {
-        let mut request = Request::new();
-        request.extensions.typing.enabled = Some(true);
-        request.extensions.typing.rooms = Some(vec![
-            ExtensionRoomConfig::AllSubscribed,
-            ExtensionRoomConfig::Room(owned_room_id!("!a:example.com")),
-        ]);
-        request.extensions.receipts.enabled = Some(true);
-        request.extensions.receipts.rooms =
-            Some(vec![ExtensionRoomConfig::Room(owned_room_id!("!a:example.com"))]);
-
-        let request = request.into_v4(user_id!("@alice:example.com"));
+    fn request_extensions_from_v4() {
+        let mut extensions = v4::request::Extensions::new();
+        extensions.typing.enabled = true;
+        extensions.receipts.enabled = true;
+        extensions.receipts.rooms = Some(vec![owned_room_id!("!a:example.com")]);
+        extensions.account_data.lists = Some(vec![]);
 
         assert_to_canonical_json_eq!(
-            request.extensions,
+            request::Extensions::from(extensions),
             json!({
                 "typing": { "enabled": true },
                 "receipts": { "enabled": true, "rooms": ["!a:example.com"] },
@@ -1376,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn extensions_from_v4() {
+    fn response_extensions_from_v4() {
         let extensions: v4::response::Extensions = from_json_value(json!({
             "to_device": { "next_batch": "1", "messages": [] },
             "e2ee": { "device_one_time_keys_count": {}, "device_unused_fallback_key_types": [] },
@@ -1435,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn room_from_v4() {
+    fn full_room_from_v4() {
         let room: v4::response::Room = from_json_value(json!({
             "name": null,
             "initial": true,
@@ -1451,7 +1447,7 @@ mod tests {
                 },
                 { "type": "m.room.topic", "state_key": "" },
             ],
-            "stripped_state": [],
+            "heroes": [{ "user_id": "@bob:example.com", "displayname": "Bob" }],
         }))
         .unwrap();
 
@@ -1460,6 +1456,18 @@ mod tests {
         assert_eq!(room.name, None);
         assert_eq!(room.initial, Some(true));
         assert_eq!(room.required_state.len(), 1);
+        assert_eq!(room.heroes.unwrap()[0].name.as_deref(), Some("Bob"));
+        assert!(room.invite_state.is_none());
+    }
+
+    #[test]
+    fn stripped_room_from_v4() {
+        let room: v4::response::Room =
+            from_json_value(json!({ "bump_stamp": 2, "stripped_state": [] })).unwrap();
+
+        let room = response::Room::from(room);
+
+        assert_eq!(room.bump_stamp, Some(uint!(2)));
         assert_eq!(room.invite_state.unwrap().len(), 0);
     }
 
